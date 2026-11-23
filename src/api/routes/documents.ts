@@ -85,15 +85,24 @@ export const documentRoutes =
       '/documents/:id/process',
       {
         schema: {
-          summary: 'Run extraction and classification (synchronous in Milestone 1)',
-          description: 'Allowed from STORED, or from FAILED as a retry.',
+          summary: 'Start OCR and classification',
+          description:
+            'Allowed from STORED, or from FAILED as a retry. Returns 200 with status PROCESSED when OCR completes synchronously (images, local stub). Returns 202 with status EXTRACTING when an asynchronous OCR job was started (PDF with Textract); poll GET /v1/documents/{id} for completion. 409 if the document is already being processed or is processed; 503 if asynchronous OCR capacity is exhausted.',
           tags: ['documents'],
           params: documentIdParamsSchema,
-          response: { 200: documentResponseSchema },
+          response: { 200: documentResponseSchema, 202: documentResponseSchema },
         },
       },
-      async (request) =>
-        toDocumentResponse(await services.processDocument.execute(request.params.id)),
+      async (request, reply) => {
+        const document = await services.processDocument.execute(request.params.id);
+        if (document.status === 'EXTRACTING') {
+          return reply
+            .code(202)
+            .header('location', `/v1/documents/${document.id}`)
+            .send(toDocumentResponse(document));
+        }
+        return reply.code(200).send(toDocumentResponse(document));
+      },
     );
 
     return Promise.resolve();

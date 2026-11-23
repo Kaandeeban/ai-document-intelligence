@@ -1,6 +1,7 @@
 /**
- * Milestone 1 local adapters. No network or cloud access. Each one implements
- * a port so it can be swapped for an AWS/PostgreSQL adapter later.
+ * Local adapters: no network or cloud access. Used by default for development
+ * and tests. Each implements a port so it can be swapped for an AWS or
+ * PostgreSQL adapter without changing application code.
  */
 import { randomUUID } from 'node:crypto';
 import type {
@@ -9,21 +10,37 @@ import type {
   DocumentClassifier,
   DocumentRepository,
   DocumentStorage,
+  ExtractionJobRequest,
   IdGenerator,
+  PutObjectOptions,
   TextExtractionRequest,
   TextExtractor,
 } from '../application/ports/index.js';
 import type { DocumentRecord } from '../domain/document.js';
+import { ConcurrentModificationError } from '../domain/errors.js';
 import type {
   ClassificationResult,
   DocumentClass,
-  ExtractionResult,
+  ExtractionCheck,
+  ExtractionStart,
 } from '../domain/processing.js';
 
+/**
+ * In-memory repository with optimistic concurrency. Data is lost on restart.
+ */
 export class InMemoryDocumentRepository implements DocumentRepository {
   private readonly records = new Map<string, DocumentRecord>();
 
   save(document: DocumentRecord): Promise<void> {
+    const stored = this.records.get(document.id);
+    const expectedVersion = stored ? stored.version + 1 : 1;
+    if (document.version !== expectedVersion) {
+      return Promise.reject(
+        new ConcurrentModificationError('Document was modified concurrently', {
+          documentId: document.id,
+        }),
+      );
+    }
     // Clone so callers cannot mutate stored state by reference.
     this.records.set(document.id, structuredClone(document));
     return Promise.resolve();
@@ -35,30 +52,59 @@ export class InMemoryDocumentRepository implements DocumentRepository {
   }
 }
 
-export class InMemoryDocumentStorage implements DocumentStorage {
-  private readonly objects = new Map<string, Uint8Array>();
+export class ObjectAlreadyExistsError extends Error {
+  override readonly name = 'ObjectAlreadyExistsError';
+}
 
-  put(key: string, content: Uint8Array): Promise<void> {
-    this.objects.set(key, new Uint8Array(content));
+export class InMemoryDocumentStorage implements DocumentStorage {
+  private readonly objects = new Map<string, { content: Uint8Array; contentType: string }>();
+
+  put(key: string, content: Uint8Array, options: PutObjectOptions): Promise<void> {
+    if (options.overwrite !== true && this.objects.has(key)) {
+      return Promise.reject(new ObjectAlreadyExistsError('Object already exists'));
+    }
+    this.objects.set(key, { content: new Uint8Array(content), contentType: options.contentType });
     return Promise.resolve();
   }
 
   get(key: string): Promise<Uint8Array | undefined> {
     const object = this.objects.get(key);
-    return Promise.resolve(object ? new Uint8Array(object) : undefined);
+    return Promise.resolve(object ? new Uint8Array(object.content) : undefined);
   }
 }
 
-/** Placeholder until Textract (Milestone 2): confirms the object exists and returns no text. */
+/**
+ * Synchronous placeholder OCR: confirms the object exists and returns no text.
+ * Used when EXTRACTOR_DRIVER=stub.
+ */
 export class StubTextExtractor implements TextExtractor {
   constructor(private readonly storage: DocumentStorage) {}
 
-  async extract(request: TextExtractionRequest): Promise<ExtractionResult> {
+  isAsynchronous(): boolean {
+    return false;
+  }
+
+  async start(request: TextExtractionRequest): Promise<ExtractionStart> {
     const content = await this.storage.get(request.storageKey);
     if (!content) {
       throw new Error(`Stored object not found for document ${request.documentId}`);
     }
-    return { provider: 'stub', text: '', pageCount: 1, confidence: 0 };
+    return {
+      status: 'COMPLETED',
+      result: {
+        provider: 'stub',
+        text: '',
+        pageCount: 1,
+        confidence: 0,
+        lines: [],
+        warnings: ['STUB_EXTRACTOR'],
+      },
+    };
+  }
+
+  check(request: ExtractionJobRequest): Promise<ExtractionCheck> {
+    // The stub never starts asynchronous jobs, so any job ID is unknown.
+    return Promise.reject(new Error(`Unknown extraction job ${request.jobId}`));
   }
 }
 

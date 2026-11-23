@@ -14,6 +14,7 @@ export const documentResponseSchema = z.object({
   sizeBytes: z.number().int(),
   sha256: z.string(),
   status: z.enum(DOCUMENT_STATUSES),
+  processingAttempts: z.number().int().nonnegative(),
   statusHistory: z.array(
     z.object({
       status: z.enum(DOCUMENT_STATUSES),
@@ -54,6 +55,7 @@ export function toDocumentResponse(document: DocumentRecord): DocumentResponse {
     mimeType: document.mimeType,
     sizeBytes: document.sizeBytes,
     sha256: document.sha256,
+    processingAttempts: document.processingAttempts,
     status: document.status,
     statusHistory: document.statusHistory.map((change) => ({
       status: change.status,

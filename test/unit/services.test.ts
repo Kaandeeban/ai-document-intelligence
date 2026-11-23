@@ -1,11 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type {
-  DocumentClassifier,
-  Logger,
-  TextExtractor,
-} from '../../src/application/ports/index.js';
-import { IngestDocumentService } from '../../src/application/services/ingest-document.js';
-import { ProcessDocumentService } from '../../src/application/services/process-document.js';
+import type { DocumentClassifier, TextExtractor } from '../../src/application/ports/index.js';
 import {
   DocumentNotFoundError,
   ExternalServiceError,
@@ -13,44 +7,11 @@ import {
   UnsupportedFileTypeError,
 } from '../../src/domain/errors.js';
 import type { ClassificationResult } from '../../src/domain/processing.js';
-import {
-  InMemoryDocumentRepository,
-  InMemoryDocumentStorage,
-  KeywordDocumentClassifier,
-} from '../../src/infrastructure/local-adapters.js';
 import { pdfBytes, pngBytes } from '../support/fixtures.js';
+import { createTestServices } from '../support/services.js';
 
-const logger: Logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
-const clock = { now: () => new Date('2026-01-01T00:00:00Z') };
-let counter = 0;
-const ids = { newId: () => `00000000-0000-4000-8000-${String(++counter).padStart(12, '0')}` };
-
-function setup(overrides: { extractor?: TextExtractor; classifier?: DocumentClassifier } = {}) {
-  const repository = new InMemoryDocumentRepository();
-  const storage = new InMemoryDocumentStorage();
-  const ingest = new IngestDocumentService({
-    repository,
-    storage,
-    clock,
-    ids,
-    logger,
-    maxUploadBytes: 4096,
-  });
-  const extractor: TextExtractor = overrides.extractor ?? {
-    extract: () =>
-      Promise.resolve({ provider: 'fake', text: 'INVOICE #1', pageCount: 1, confidence: 0.9 }),
-  };
-  const process = new ProcessDocumentService({
-    repository,
-    extractor,
-    classifier: overrides.classifier ?? new KeywordDocumentClassifier(),
-    clock,
-    logger,
-  });
-  const ingestPdf = () =>
-    ingest.execute({ filename: 'a.pdf', declaredMimeType: 'application/pdf', content: pdfBytes() });
-  return { repository, storage, ingest, process, ingestPdf };
-}
+const setup = (overrides: { extractor?: TextExtractor; classifier?: DocumentClassifier } = {}) =>
+  createTestServices(overrides);
 
 describe('IngestDocumentService', () => {
   it('stores content, records a checksum and moves to STORED', async () => {
@@ -120,7 +81,11 @@ describe('ProcessDocumentService', () => {
       confidence: 5,
     };
     const { ingestPdf, process, repository } = setup({
-      extractor: { extract: () => Promise.resolve(malformed) },
+      extractor: {
+        isAsynchronous: () => false,
+        start: () => Promise.resolve({ status: 'COMPLETED', result: malformed }),
+        check: () => Promise.reject(new Error('unused')),
+      },
     });
     const { id } = await ingestPdf();
     await expect(process.execute(id)).rejects.toThrow(

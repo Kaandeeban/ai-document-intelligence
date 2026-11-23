@@ -11,14 +11,14 @@ import {
 } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { AppConfig } from '../config/env.js';
-import { createLocalAdapters, createServices, type Adapters } from '../container.js';
+import { createApplication, type ApplicationOverrides } from '../container.js';
 import { errorHandler, notFoundHandler } from './errors.js';
 import { documentRoutes } from './routes/documents.js';
 
 export interface BuildAppOptions {
   readonly config: AppConfig;
-  /** Override individual adapters (used by tests; later by AWS wiring). */
-  readonly adapters?: Partial<Adapters>;
+  /** Override individual adapters or the completion scheduler (used by tests). */
+  readonly adapters?: ApplicationOverrides;
 }
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
@@ -90,8 +90,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     () => ({ status: 'ok' as const }),
   );
 
-  const services = createServices(config, createLocalAdapters(options.adapters), app.log);
-  await app.register(documentRoutes(services), { prefix: '/v1' });
+  const application = createApplication(config, app.log, options.adapters);
+  app.addHook('onClose', async () => {
+    await application.close();
+  });
+  app.log.info(
+    { storageDriver: config.storage.driver, extractorDriver: config.extraction.driver },
+    'Adapters selected',
+  );
+  await app.register(documentRoutes(application.services), { prefix: '/v1' });
 
   return app;
 }

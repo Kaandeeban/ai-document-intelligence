@@ -20,7 +20,25 @@ const MAX_FILENAME_LENGTH = 255;
  * Accepts an upload only when the extension, declared MIME type and actual
  * content signature all agree on one supported type. Returns that type.
  */
-export function validateUpload(candidate: UploadCandidate, maxBytes: number): SupportedFileType {
+export type MaxBytesByType = Readonly<Partial<Record<SupportedFileType, number>>>;
+
+export function validateUpload(
+  candidate: UploadCandidate,
+  maxBytes: number,
+  maxBytesByType: MaxBytesByType = {},
+): SupportedFileType {
+  const detected = validateUploadType(candidate, maxBytes);
+  const typeLimit = maxBytesByType[detected];
+  if (typeLimit !== undefined && candidate.content.byteLength > typeLimit) {
+    throw new FileTooLargeError(
+      `${detected.toUpperCase()} files must not exceed ${typeLimit} bytes`,
+      { maxBytes: typeLimit, fileType: detected },
+    );
+  }
+  return detected;
+}
+
+function validateUploadType(candidate: UploadCandidate, maxBytes: number): SupportedFileType {
   const { content, filename, declaredMimeType } = candidate;
   if (content.byteLength === 0) {
     throw new EmptyFileError('Uploaded file is empty');

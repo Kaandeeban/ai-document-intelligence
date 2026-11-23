@@ -9,6 +9,8 @@ export type ErrorCode =
   | 'UNSUPPORTED_FILE_TYPE'
   | 'DOCUMENT_NOT_FOUND'
   | 'INVALID_STATUS_TRANSITION'
+  | 'CONCURRENT_MODIFICATION'
+  | 'SERVICE_UNAVAILABLE'
   | 'EXTERNAL_SERVICE_ERROR';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
@@ -50,4 +52,14 @@ export class InvalidStatusTransitionError extends DomainError {
 
 export class ExternalServiceError extends DomainError {
   readonly code = 'EXTERNAL_SERVICE_ERROR';
+}
+
+/** Optimistic-concurrency conflict: the record changed since it was read. */
+export class ConcurrentModificationError extends DomainError {
+  readonly code = 'CONCURRENT_MODIFICATION';
+}
+
+/** Temporary capacity limit reached; the caller should retry later. */
+export class ServiceUnavailableError extends DomainError {
+  readonly code = 'SERVICE_UNAVAILABLE';
 }
