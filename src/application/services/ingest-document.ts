@@ -5,6 +5,7 @@ import { SUPPORTED_FILE_TYPES } from '../../domain/file-type.js';
 import {
   sanitizeFilename,
   validateUpload,
+  type MaxBytesByType,
   type UploadCandidate,
 } from '../../domain/upload-policy.js';
 import type {
@@ -22,14 +23,16 @@ export interface IngestDocumentDeps {
   readonly ids: IdGenerator;
   readonly logger: Logger;
   readonly maxUploadBytes: number;
+  /** Stricter per-type limits imposed by the configured OCR engine. */
+  readonly maxBytesByType?: MaxBytesByType;
 }
 
 export class IngestDocumentService {
   constructor(private readonly deps: IngestDocumentDeps) {}
 
   async execute(upload: UploadCandidate): Promise<DocumentRecord> {
-    const { repository, storage, clock, ids, logger, maxUploadBytes } = this.deps;
-    const fileType = validateUpload(upload, maxUploadBytes);
+    const { repository, storage, clock, ids, logger, maxUploadBytes, maxBytesByType } = this.deps;
+    const fileType = validateUpload(upload, maxUploadBytes, maxBytesByType);
     const mimeType = SUPPORTED_FILE_TYPES[fileType].mimeType;
 
     let document = createDocument({
@@ -44,7 +47,11 @@ export class IngestDocumentService {
     await repository.save(document);
 
     try {
-      await storage.put(document.storageKey, upload.content, mimeType);
+      await storage.put(document.storageKey, upload.content, {
+        contentType: mimeType,
+        sha256Hex: document.sha256,
+        metadata: { 'document-id': document.id },
+      });
     } catch (cause) {
       document = transitionDocument(document, 'FAILED', clock.now(), 'Storage write failed');
       await repository.save(document);

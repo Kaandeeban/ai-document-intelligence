@@ -21,6 +21,8 @@ const DOMAIN_STATUS: Readonly<Record<ErrorCode, number>> = {
   UNSUPPORTED_FILE_TYPE: 415,
   DOCUMENT_NOT_FOUND: 404,
   INVALID_STATUS_TRANSITION: 409,
+  CONCURRENT_MODIFICATION: 409,
+  SERVICE_UNAVAILABLE: 503,
   EXTERNAL_SERVICE_ERROR: 502,
 };
 
@@ -35,6 +37,7 @@ const TITLES: Readonly<Record<number, string>> = {
   429: 'Too Many Requests',
   500: 'Internal Server Error',
   502: 'Bad Gateway',
+  503: 'Service Unavailable',
 };
 
 /** RFC 9457 problem details, extended with a stable code and the request ID. */
@@ -107,6 +110,7 @@ export function errorHandler(
   } else {
     request.log.info({ code: problem.code, status: problem.status }, 'Request rejected');
   }
+  if (problem.status === 503) void reply.header('retry-after', '30');
   return reply.code(problem.status).type('application/problem+json').send(problem);
 }
 

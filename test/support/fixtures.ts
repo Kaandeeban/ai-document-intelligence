@@ -25,6 +25,16 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxUploadBytes: 4096,
     requestTimeoutMs: 5000,
     apiDocsEnabled: false,
+    storage: { driver: 'memory' },
+    extraction: {
+      driver: 'stub',
+      pollInitialDelayMs: 5,
+      pollMaxDelayMs: 20,
+      jobTimeoutMs: 5_000,
+      maxResultPages: 10,
+      maxPendingJobs: 10,
+    },
+    aws: { maxAttempts: 3, connectionTimeoutMs: 1_000, requestTimeoutMs: 1_000 },
     ...overrides,
   };
 }

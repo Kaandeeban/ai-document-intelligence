@@ -1,76 +1,150 @@
-import type { z } from 'zod';
-import { transitionDocument, type DocumentRecord } from '../../domain/document.js';
-import { DocumentNotFoundError, ExternalServiceError } from '../../domain/errors.js';
 import {
-  classificationResultSchema,
-  extractionResultSchema,
-  type ClassificationResult,
-  type ExtractionResult,
-} from '../../domain/processing.js';
+  processingEligibility,
+  withoutLastFailure,
+  transitionDocument,
+  type DocumentRecord,
+  type ExtractionJob,
+} from '../../domain/document.js';
+import {
+  DocumentNotFoundError,
+  ExternalServiceError,
+  InvalidStatusTransitionError,
+  ServiceUnavailableError,
+} from '../../domain/errors.js';
+import { extractionStartSchema } from '../../domain/processing.js';
 import type {
+  CapacityReservation,
   Clock,
-  DocumentClassifier,
+  CompletionScheduler,
   DocumentRepository,
   Logger,
   TextExtractor,
 } from '../ports/index.js';
+import type { ExtractionFinalizer } from './extraction-finalizer.js';
+import {
+  callAdapter,
+  parseAdapterResponse,
+  recordProcessingFailure,
+} from './processing-support.js';
 
 export interface ProcessDocumentDeps {
   readonly repository: DocumentRepository;
   readonly extractor: TextExtractor;
-  readonly classifier: DocumentClassifier;
+  readonly finalizer: ExtractionFinalizer;
+  readonly scheduler: CompletionScheduler;
   readonly clock: Clock;
   readonly logger: Logger;
+  /** Delay before the first status check of an asynchronous OCR job. */
+  readonly initialCheckDelayMs: number;
 }
 
 /**
- * Orchestrates extraction then classification for a stored document.
- * Runs synchronously in Milestone 1; Milestone 4 moves it behind SQS.
- * Every adapter response is re-validated here so a faulty adapter cannot
- * corrupt persisted state.
+ * Starts processing a STORED or FAILED document.
+ * - Synchronous OCR: completes extraction and classification, returns PROCESSED.
+ * - Asynchronous OCR: records the job, schedules completion, returns EXTRACTING
+ *   without waiting for the job.
  */
 export class ProcessDocumentService {
   constructor(private readonly deps: ProcessDocumentDeps) {}
 
   async execute(id: string): Promise<DocumentRecord> {
-    const { repository, clock, logger } = this.deps;
+    const { repository, extractor, scheduler } = this.deps;
     const existing = await repository.findById(id);
     if (!existing) {
       throw new DocumentNotFoundError('Document not found', { documentId: id });
     }
+    const eligibility = processingEligibility(existing);
+    if (!eligibility.allowed) {
+      throw new InvalidStatusTransitionError(eligibility.reason, {
+        documentId: id,
+        status: existing.status,
+      });
+    }
 
-    let document = transitionDocument(existing, 'PROCESSING', clock.now());
-    await repository.save(document);
+    // Only asynchronous jobs occupy scheduler capacity. The slot is reserved
+    // synchronously BEFORE any await, so concurrent requests cannot oversubscribe.
+    let reservation: CapacityReservation | undefined;
+    if (extractor.isAsynchronous(existing.fileType)) {
+      reservation = scheduler.reserve();
+      if (!reservation) {
+        throw new ServiceUnavailableError('Processing capacity reached; retry later', {
+          retryAfterSeconds: 30,
+        });
+      }
+    }
 
     try {
-      const extraction = await this.extract(document);
-      const classification = await this.classify(document.id, extraction.text);
-      const completedAt = clock.now();
+      return await this.run(existing, reservation);
+    } finally {
+      // No-op if `schedule` consumed it; otherwise frees the slot on every
+      // non-async outcome and on every failure path.
+      reservation?.release();
+    }
+  }
+
+  private async run(
+    existing: DocumentRecord,
+    reservation: CapacityReservation | undefined,
+  ): Promise<DocumentRecord> {
+    const { repository, extractor, finalizer, scheduler, clock, logger } = this.deps;
+    const id = existing.id;
+    const startedAt = clock.now();
+    let document: DocumentRecord = {
+      ...transitionDocument(withoutLastFailure(existing), 'PROCESSING', startedAt),
+      processingAttempts: existing.processingAttempts + 1,
+    };
+    // Optimistic concurrency: a concurrent request for the same document fails
+    // here with ConcurrentModificationError, before any OCR job is submitted.
+    await repository.save(document);
+
+    let submittedJob: ExtractionJob | undefined;
+    try {
+      const rawStart = await callAdapter('Text extraction', () =>
+        extractor.start({
+          documentId: id,
+          storageKey: document.storageKey,
+          fileType: document.fileType,
+          attempt: document.processingAttempts,
+        }),
+      );
+      const start = parseAdapterResponse(extractionStartSchema, rawStart, 'Text extraction');
+
+      if (start.status === 'COMPLETED') {
+        return await finalizer.finalize(document, start.result, startedAt);
+      }
+
+      submittedJob = { provider: start.provider, jobId: start.jobId, startedAt, checks: 0 };
       document = {
-        ...transitionDocument(document, 'PROCESSED', completedAt),
-        processing: {
-          extraction: {
-            provider: extraction.provider,
-            pageCount: extraction.pageCount,
-            characterCount: extraction.text.length,
-            confidence: extraction.confidence,
-          },
-          classification,
-          completedAt,
-        },
+        ...transitionDocument(document, 'EXTRACTING', clock.now()),
+        extractionJob: submittedJob,
       };
       await repository.save(document);
+      scheduler.schedule(id, this.deps.initialCheckDelayMs, reservation);
       logger.info(
-        { documentId: id, documentClass: classification.documentClass },
-        'Document processed',
+        { documentId: id, provider: start.provider, attempt: document.processingAttempts },
+        'Asynchronous text extraction started',
       );
       return document;
     } catch (error) {
-      const reason =
-        error instanceof ExternalServiceError ? error.message : 'Unexpected processing error';
-      document = transitionDocument(document, 'FAILED', clock.now(), reason);
-      await repository.save(document);
-      logger.error({ documentId: id, err: error }, 'Document processing failed');
+      if (submittedJob) {
+        // The job was submitted (and is billable) but could not be tracked.
+        // Durable recovery needs persistent job tracking (Milestones 4/5); until
+        // then the job ID is logged and kept on the failed record for reconciliation.
+        logger.warn(
+          {
+            documentId: id,
+            provider: submittedJob.provider,
+            jobId: submittedJob.jobId,
+            attempt: document.processingAttempts,
+          },
+          'OCR job submitted but could not be tracked; it will not be collected',
+        );
+      }
+      await recordProcessingFailure(this.deps, id, error, {
+        ...(submittedJob === undefined
+          ? {}
+          : { orphanedJob: submittedJob, reason: 'Text extraction job could not be tracked' }),
+      });
       throw error instanceof ExternalServiceError
         ? error
         : new ExternalServiceError(
@@ -80,48 +154,4 @@ export class ProcessDocumentService {
           );
     }
   }
-
-  private async extract(document: DocumentRecord): Promise<ExtractionResult> {
-    const raw = await this.callAdapter('Text extraction', () =>
-      this.deps.extractor.extract({
-        documentId: document.id,
-        storageKey: document.storageKey,
-        fileType: document.fileType,
-      }),
-    );
-    return parseAdapterResponse(extractionResultSchema, raw, 'Text extraction');
-  }
-
-  private async classify(documentId: string, text: string): Promise<ClassificationResult> {
-    const raw = await this.callAdapter('Classification', () =>
-      this.deps.classifier.classify({ documentId, text }),
-    );
-    return parseAdapterResponse(classificationResultSchema, raw, 'Classification');
-  }
-
-  private async callAdapter<T>(stage: string, call: () => Promise<T>): Promise<T> {
-    try {
-      return await call();
-    } catch (cause) {
-      throw new ExternalServiceError(`${stage} failed`, { stage }, { cause });
-    }
-  }
-}
-
-function parseAdapterResponse<S extends z.ZodType>(
-  schema: S,
-  raw: unknown,
-  stage: string,
-): z.output<S> {
-  const result = schema.safeParse(raw);
-  if (!result.success) {
-    throw new ExternalServiceError(`${stage} returned an invalid response`, {
-      stage,
-      issues: result.error.issues.map((issue) => ({
-        path: issue.path.join('.'),
-        message: issue.message,
-      })),
-    });
-  }
-  return result.data;
 }
